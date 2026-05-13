@@ -2,22 +2,29 @@ package com.memory.retrieval
 
 import com.memory.store.MemoryEntry
 import com.memory.store.MemorySource
+import com.memory.temporal.TemporalReasoner
+import com.memory.temporal.TemporalContext
+import com.memory.temporal.TemporalDirection
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Multi-Signal Retriever (受 Mem0 v3 + MemMachine 启发)
+ * Multi-Signal Retriever v2 (受 Mem0 v3 + MemMachine + Temporal Reasoning 启发)
  *
  * 在 ADD-only 存储上实现智能检索：
  * - 矛盾解决：不删除旧记忆，通过 recency + relevance 自然降权
- * - 时间推理：temporal signal 区分 "过去住在X" vs "现在住在Y"
+ * - 时间推理：TemporalReasoner 分析 query 时间意图，动态调整 anchor
  * - Entity boosting：query 中的 entity 与记忆中的 entity 匹配时加权
  * - Source weighting：USER/AGENT/SYSTEM 来源有不同基础权重
  *
  * 核心公式:
- * final_score = semantic_score × recency_boost × entity_boost × source_weight × access_frequency
+ * final_score = (semantic×0.5 + keyword×0.2 + entity×0.15 + temporal×0.15) × source_weight
+ *
+ * v2 变更：temporal signal 由 TemporalReasoner 驱动
+ * - 无时间意图：退化为标准 recency decay（与 v1 行为一致）
+ * - 有时间意图：anchor 移动到 query 指向的时间点，得分基于 |memory - anchor|
  *
  * 这是"查询时的视图函数"——不改变底层数据，只改变看数据的方式
  */
@@ -31,14 +38,17 @@ class MultiSignalRetriever(
     // Temporal recency weight
     private val temporalWeight: Double = 0.15,
     
-    // Time decay parameters
+    // Time decay parameters (used when no temporal intent detected)
     private val halfLifeDays: Double = 30.0,      // 30天半衰期
     private val minRecencyScore: Double = 0.1,     // 最低时间分（不降为0）
     
     // Source weights
     private val userSourceWeight: Double = 1.0,
     private val agentSourceWeight: Double = 0.9,   // Agent facts slightly lower
-    private val systemSourceWeight: Double = 0.7
+    private val systemSourceWeight: Double = 0.7,
+    
+    // Temporal Reasoner instance
+    private val temporalReasoner: TemporalReasoner = TemporalReasoner()
 ) {
     
     /**
@@ -60,13 +70,17 @@ class MultiSignalRetriever(
     ): List<RankedMemory> {
         if (candidates.isEmpty()) return emptyList()
         
+        // Analyze temporal intent once for the query
+        val temporalContext = temporalReasoner.analyze(query, currentTime)
+        
         return candidates.map { candidate ->
             val signals = computeSignals(
                 candidate = candidate,
                 query = query,
                 queryEntities = queryEntities,
                 contextEntities = contextEntities,
-                currentTime = currentTime
+                currentTime = currentTime,
+                temporalContext = temporalContext
             )
             
             val finalScore = combineSignals(signals)
@@ -89,7 +103,8 @@ class MultiSignalRetriever(
         query: String,
         queryEntities: List<String>,
         contextEntities: List<String>,
-        currentTime: Long
+        currentTime: Long,
+        temporalContext: TemporalContext
     ): SignalScores {
         // 1. Semantic score (from vector search)
         val semantic = candidate.semanticScore
@@ -100,8 +115,14 @@ class MultiSignalRetriever(
         // 3. Entity boost
         val entity = computeEntityScore(queryEntities, contextEntities, candidate.entry.entities)
         
-        // 4. Temporal recency
-        val recency = computeRecencyScore(candidate.entry.timestamp, currentTime)
+        // 4. Temporal score — uses TemporalReasoner when intent detected
+        val temporal = if (temporalContext.direction != TemporalDirection.NONE) {
+            // Query has temporal intent → use anchor-based scoring
+            temporalReasoner.computeTemporalScore(candidate.entry.timestamp, temporalContext)
+        } else {
+            // No temporal intent → standard recency decay (backward compatible)
+            computeRecencyScore(candidate.entry.timestamp, currentTime)
+        }
         
         // 5. Source weight
         val source = when (candidate.entry.source) {
@@ -114,7 +135,7 @@ class MultiSignalRetriever(
             semantic = semantic,
             keyword = keyword,
             entity = entity,
-            recency = recency,
+            recency = temporal,
             sourceWeight = source
         )
     }
@@ -164,7 +185,7 @@ class MultiSignalRetriever(
     }
     
     /**
-     * 时间衰减分数
+     * 时间衰减分数 (fallback: 无时间意图时使用)
      * 越新的记忆分越高，但永不降为0（保留可发现性）
      */
     private fun computeRecencyScore(memoryTimestamp: Long, currentTime: Long): Double {
